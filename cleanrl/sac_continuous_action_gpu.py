@@ -177,6 +177,8 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="Hopper-v4",
         help="the id of the environment")
+    parser.add_argument("--num-envs", type=int, default=10,
+                        help="number of // environments")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
@@ -185,7 +187,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--tau", type=float, default=0.005,
         help="target smoothing coefficient (default: 0.005)")
-    parser.add_argument("--batch-size", type=int, default=256,
+    parser.add_argument("--batch-size", type=int, default=1024,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--learning-starts", type=int, default=5e3,
         help="timestep to start learning")
@@ -225,22 +227,26 @@ def make_vector_env(args):
     # todo: if you actually use this implementation, replace this by a torch-enabled vectorized environment.
     # todo: IsaacGym or Brax+brax2torch are good choices.
 
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
+    def thunk(seed):
+        return make_env(args.env_id, seed, 0, args.capture_video, run_name)
+    envs = gym.vector.SyncVectorEnv([thunk(args.seed + i) for i in range(args.num_envs)])   # 4 envs
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     old_step = envs.step
     old_reset = envs.reset
     def torch_step(actions):
-        assert isinstance(actions, torch.Tensor)
-        obs, rew, done, truncations, infos = old_step(actions.cpu().numpy())
-        obs = torch.asarray(obs, device=device)
-        rew = torch.asarray(rew, device=device)
-        done = torch.asarray(done, device=device)
-        truncations = torch.asarray(truncations, device=device)
+        with torch.no_grad():
+            assert isinstance(actions, torch.Tensor)
+            obs, rew, done, truncations, infos = old_step(actions.detach().cpu().numpy())
+            obs = torch.asarray(obs, device=device)
+            rew = torch.asarray(rew, device=device)
+            done = torch.asarray(done, device=device)
+            truncations = torch.asarray(truncations, device=device)
         return obs, rew, done, truncations, infos
 
     def torch_reset(**kwargs):
-        obs, infos = old_reset(**kwargs)
+        with torch.no_grad():
+            obs, infos = old_reset(**kwargs)
         return torch.tensor(obs, device=device), infos
 
     envs.step = torch_step
@@ -279,10 +285,10 @@ class Actor(nn.Module):
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
         # action rescaling
         self.register_buffer(
-            "action_scale", torch.tensor((env.action_space.high - env.action_space.low) / 2.0, dtype=torch.float32)
+            "action_scale", torch.tensor((env.single_action_space.high - env.single_action_space.low) / 2.0, dtype=torch.float32)
         )
         self.register_buffer(
-            "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
+            "action_bias", torch.tensor((env.single_action_space.high + env.single_action_space.low) / 2.0, dtype=torch.float32)
         )
 
     def forward(self, x):
@@ -382,8 +388,9 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
-        in_device="cpu",
+        in_device=device, # use in_device="cpu" if you don't have a huge beefy GPU with tons of RAM
         out_device=device,
+        n_envs=envs.num_envs
     )
 
     def make_random_action_sampler():
@@ -408,18 +415,24 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             actions = random_action_sampler()
         else:
             actions, _, _ = actor.get_action(obs.float())
-            actions = actions.detach().cpu()
+            actions = actions.detach()
 
         # TRY NOT TO MODIFY: execute the game and log data.
         next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
+            collect_r = []
+            collect_l = []
             for info in infos["final_info"]:
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
-                break
+                if info is None:
+                    continue
+                collect_r.append(info["episode"]["r"])
+                collect_l.append(info["episode"]["l"])
+            import numpy as np
+            print(f"global_step={global_step}, episodic_return={np.array(collect_r).mean()}")
+            writer.add_scalar("charts/episodic_return", np.array(collect_r).mean(), global_step)
+            writer.add_scalar("charts/episodic_length", np.array(collect_l).mean(), global_step)
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
         real_next_obs = torch.clone(next_obs)
